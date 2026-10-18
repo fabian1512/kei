@@ -90,10 +90,13 @@ fn input_stamp(
 
 async fn scratch() -> anyhow::Result<Scratch> {
     let path = std::env::temp_dir().join(format!("kei-inventory-{}", uuid::Uuid::new_v4()));
-    let mut builder = tokio::fs::DirBuilder::new();
     #[cfg(unix)]
-    builder.mode(0o700);
-    builder.create(&path).await?;
+    {
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.mode(0o700).create(&path).await?;
+    }
+    #[cfg(not(unix))]
+    tokio::fs::create_dir(&path).await?;
     Ok(Scratch(path))
 }
 

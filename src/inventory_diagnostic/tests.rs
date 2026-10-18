@@ -1,4 +1,6 @@
-use super::{bounded_file, collect, endpoint_allowed};
+#[cfg(unix)]
+use super::bounded_file;
+use super::{collect, endpoint_allowed};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
