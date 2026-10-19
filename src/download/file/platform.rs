@@ -20,7 +20,23 @@ pub(super) fn fsync_parent_dir_best_effort_blocking(path: &Path) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::download) enum PublishResult {
     Published,
+    /// Published, but the no-overwrite hard-link fallback's temporary entry
+    /// could not be safely removed (a foreign writer may have replaced it, or
+    /// the unlink itself failed and a retry did not clear it). The caller's
+    /// bytes and ownership evidence are intact; only cleanup of the extra
+    /// link is outstanding.
+    PublishedWithRetainedTemp,
     DestinationExists,
+}
+
+/// Outcome of a no-overwrite publication's own temporary-entry cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkCleanupOutcome {
+    /// The temporary entry was removed; the destination keeps exactly one link.
+    Cleaned,
+    /// The destination's bytes are correct, but the temporary entry's own
+    /// link could not be safely or successfully removed.
+    Retained,
 }
 
 /// A retirement move must consume the source atomically. Link publication is
@@ -78,24 +94,27 @@ pub(in crate::download) fn exchange_layout_confined(
 pub(in crate::download) fn publish_reconciliation_part_blocking(
     part: &ConfinedPath,
     destination: &ConfinedPath,
+    #[allow(unused_variables)] part_identity: crate::fs_util::FileIdentity,
 ) -> std::io::Result<PublishResult> {
     #[cfg(target_os = "linux")]
-    let result =
-        renameat2_confined_blocking(part, destination, libc::RENAME_NOREPLACE).or_else(|error| {
-            if is_renameat2_unsupported(&error) {
-                hard_link_confined(part, destination)
-            } else {
-                Err(error)
-            }
-        });
+    let result = match renameat2_confined_blocking(part, destination, libc::RENAME_NOREPLACE) {
+        Ok(()) => Ok(LinkCleanupOutcome::Cleaned),
+        Err(error) if is_renameat2_unsupported(&error) => {
+            hard_link_then_unlink_confined(part, destination, part_identity)
+        }
+        Err(error) => Err(error),
+    };
     #[cfg(target_os = "macos")]
-    let result = rename_confined_macos(part, destination, libc::RENAME_EXCL);
+    let result =
+        rename_confined_macos(part, destination, libc::RENAME_EXCL).map(|()| LinkCleanupOutcome::Cleaned);
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    let result = hard_link_confined(part, destination);
+    let result = hard_link_then_unlink_confined(part, destination, part_identity);
     #[cfg(windows)]
-    let result = move_file_no_replace_blocking(part.path(), destination.path());
+    let result = move_file_no_replace_blocking(part.path(), destination.path())
+        .map(|()| LinkCleanupOutcome::Cleaned);
     match result {
-        Ok(()) => Ok(PublishResult::Published),
+        Ok(LinkCleanupOutcome::Cleaned) => Ok(PublishResult::Published),
+        Ok(LinkCleanupOutcome::Retained) => Ok(PublishResult::PublishedWithRetainedTemp),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(PublishResult::DestinationExists)
         }
@@ -123,6 +142,183 @@ pub(super) fn hard_link_confined(
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Publish `part` to `destination` by hard link, then unlink `part` so the
+/// destination keeps exactly one link. Mirrors `publish_part_by_hard_link`.
+///
+/// Without the unlink the published entry keeps `nlink == 2` (shared with the
+/// retained reconciliation part). The primary layout hardlink guard
+/// (`file::primary_layout::snapshot`) refuses any entry with `nlink > 1`, so a
+/// filesystem without `renameat2(RENAME_NOREPLACE)` support (e.g. CephFS, NFS)
+/// would otherwise deadlock.
+///
+/// `expected_identity` is `part`'s identity as observed by the caller before
+/// this call, mirroring `replacement_recovery::finish_owned_prepared_link`'s
+/// own identity contract. A foreign writer can replace `part`'s name with an
+/// unrelated entry in the window between `linkat` succeeding and this
+/// function's unlink; removing that entry on the caller's behalf would delete
+/// bytes this function never published. The identity is re-checked
+/// immediately before unlinking, and the entry is left untouched (not
+/// unlinked) on any mismatch.
+///
+/// A transient unlink failure (e.g. `EBUSY`/`ESTALE`, observed on NFS/CephFS)
+/// is retried once. If the identity check fails or the retry also fails, the
+/// destination's bytes are already correct and durable; only removal of the
+/// now-redundant temporary link is outstanding, reported via
+/// [`LinkCleanupOutcome::Retained`] rather than failing the publication.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn hard_link_then_unlink_confined(
+    part: &ConfinedPath,
+    destination: &ConfinedPath,
+    expected_identity: crate::fs_util::FileIdentity,
+) -> std::io::Result<LinkCleanupOutcome> {
+    hard_link_confined(part, destination)?;
+    if let Err(error) = part.validate_identity(expected_identity) {
+        tracing::warn!(target: "kei::download::file",
+            path = %part.path().display(),
+            %error,
+            "Temporary entry changed after no-overwrite hard link; retaining it rather than risking a foreign file"
+        );
+        return Ok(LinkCleanupOutcome::Retained);
+    }
+    // One immediate retry absorbs the common transient case without masking
+    // a persistent failure (e.g. a read-only remount, a permissions change).
+    let unlink_result = unlink_confined(part).or_else(|first_error| {
+        if part.validate_identity(expected_identity).is_err() {
+            return Err(first_error);
+        }
+        unlink_confined(part).map_err(|_| first_error)
+    });
+    if let Err(error) = unlink_result {
+        tracing::warn!(target: "kei::download::file",
+            path = %part.path().display(),
+            %error,
+            "Failed to remove published temporary after no-overwrite hard link; entry retains an extra link"
+        );
+        return Ok(LinkCleanupOutcome::Retained);
+    }
+    part.sync_parent()?;
+    destination.sync_parent()?;
+    Ok(LinkCleanupOutcome::Cleaned)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unlink_confined(part: &ConfinedPath) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = tests::unlink_fault_injection(part.path()) {
+        return result;
+    }
+    // SAFETY: the retained parent directory descriptor and the NUL-terminated
+    // name remain live for the syscall, and unlinkat does not follow the leaf.
+    if unsafe { libc::unlinkat(part.parent_fd(), part.name_cstr().as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{LinkCleanupOutcome, hard_link_then_unlink_confined};
+    use crate::fs_util::{ConfinedParents, ConfinedPath, file_identity};
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Mutex;
+
+    // Scopes a fixed number of injected unlinkat failures to a single path,
+    // so tests can model a transient fault (one failure, then success) or a
+    // persistent one (every attempt fails) without touching real I/O.
+    static UNLINK_FAULTS: Mutex<Option<HashMap<std::path::PathBuf, u32>>> = Mutex::new(None);
+
+    fn inject_unlink_failures(path: &std::path::Path, count: u32) {
+        UNLINK_FAULTS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), count);
+    }
+
+    pub(super) fn unlink_fault_injection(
+        path: &std::path::Path,
+    ) -> Option<std::io::Result<()>> {
+        let mut guard = UNLINK_FAULTS.lock().unwrap();
+        let remaining = guard.as_mut()?.get_mut(path)?;
+        if *remaining == 0 {
+            return None;
+        }
+        *remaining -= 1;
+        Some(Err(std::io::Error::from_raw_os_error(libc::EBUSY)))
+    }
+
+    fn setup(root: &std::path::Path) -> (ConfinedPath, ConfinedPath, crate::fs_util::FileIdentity) {
+        let source = root.join("source.jpg");
+        let destination = root.join("destination.jpg");
+        std::fs::write(&source, b"reconcile me").unwrap();
+        let part = ConfinedPath::open(root, &source, ConfinedParents::Existing).unwrap();
+        let identity = file_identity(&part.open_regular().unwrap()).unwrap();
+        let destination = ConfinedPath::open(root, &destination, ConfinedParents::Create).unwrap();
+        (part, destination, identity)
+    }
+
+    #[test]
+    fn retries_a_transient_unlink_failure_and_reaches_steady_state() {
+        let root = tempfile::tempdir().unwrap();
+        let (part, destination, identity) = setup(root.path());
+        inject_unlink_failures(part.path(), 1);
+
+        let outcome = hard_link_then_unlink_confined(&part, &destination, identity).unwrap();
+
+        assert_eq!(outcome, LinkCleanupOutcome::Cleaned);
+        assert!(!part.path().exists(), "temporary must be removed once the retry succeeds");
+        assert_eq!(std::fs::metadata(destination.path()).unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn retains_entry_on_persistent_unlink_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let (part, destination, identity) = setup(root.path());
+        inject_unlink_failures(part.path(), 2);
+
+        let outcome = hard_link_then_unlink_confined(&part, &destination, identity).unwrap();
+
+        assert_eq!(outcome, LinkCleanupOutcome::Retained);
+        assert!(part.path().exists(), "bytes must be retained, not lost, when cleanup cannot complete");
+        assert_eq!(
+            std::fs::metadata(destination.path()).unwrap().nlink(),
+            2,
+            "destination still shares its link with the retained temporary"
+        );
+        assert_eq!(
+            std::fs::read(destination.path()).unwrap(),
+            b"reconcile me",
+            "destination bytes are correct regardless of cleanup outcome"
+        );
+    }
+
+    #[test]
+    fn retains_entry_when_expected_identity_does_not_match() {
+        let root = tempfile::tempdir().unwrap();
+        let (part, destination, _identity) = setup(root.path());
+        // A foreign identity stands in for a writer having replaced the
+        // temporary's name between linkat and this cleanup: the entry must
+        // be preserved, not unlinked on the caller's behalf.
+        let foreign = root.path().join("unrelated.jpg");
+        std::fs::write(&foreign, b"not part of this publication").unwrap();
+        let foreign_identity =
+            file_identity(&ConfinedPath::open(root.path(), &foreign, ConfinedParents::Existing)
+                .unwrap()
+                .open_regular()
+                .unwrap())
+            .unwrap();
+
+        let outcome =
+            hard_link_then_unlink_confined(&part, &destination, foreign_identity).unwrap();
+
+        assert_eq!(outcome, LinkCleanupOutcome::Retained);
+        assert!(part.path().exists(), "entry with a mismatched identity must not be unlinked");
+        assert_eq!(std::fs::metadata(destination.path()).unwrap().nlink(), 2);
     }
 }
 
@@ -525,8 +721,11 @@ mod tests {
             let destination =
                 ConfinedPath::open(&root, &target, ConfinedParents::Existing).unwrap();
             let retired = ConfinedPath::open(&root, &retired, ConfinedParents::Existing).unwrap();
+            let source_identity =
+                crate::fs_util::file_identity(&source.open_regular().unwrap()).unwrap();
             assert_eq!(
-                publish_reconciliation_part_blocking(&source, &destination).unwrap(),
+                publish_reconciliation_part_blocking(&source, &destination, source_identity)
+                    .unwrap(),
                 PublishResult::DestinationExists
             );
             assert_eq!(std::fs::read(source.path()).unwrap(), b"second source");
@@ -537,8 +736,11 @@ mod tests {
             move_layout_confined(&destination, &retired).unwrap();
             assert_eq!(std::fs::read(retired.path()).unwrap(), b"verified source");
             assert!(!destination.path().exists());
+            let source_identity =
+                crate::fs_util::file_identity(&source.open_regular().unwrap()).unwrap();
             assert_eq!(
-                publish_reconciliation_part_blocking(&source, &destination).unwrap(),
+                publish_reconciliation_part_blocking(&source, &destination, source_identity)
+                    .unwrap(),
                 PublishResult::Published
             );
             assert_eq!(std::fs::read(destination.path()).unwrap(), b"second source");
