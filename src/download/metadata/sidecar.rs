@@ -126,7 +126,11 @@ pub(in crate::download) fn write_reconciled_sidecar(
         file.sync_all()?;
         let temp_identity = crate::fs_util::file_identity(&file)?;
         temp.validate_identity(temp_identity)?;
-        crate::download::file::publish_reconciliation_part_blocking(&temp, &destination, temp_identity)?;
+        crate::download::file::publish_reconciliation_part_blocking(
+            &temp,
+            &destination,
+            temp_identity,
+        )?;
         let installed = ReconciledSidecarSnapshot::read(destination)?
             .context("Reconciled sidecar disappeared")?;
         anyhow::ensure!(

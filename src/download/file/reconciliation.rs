@@ -213,7 +213,8 @@ fn copy_local_file_no_replace_blocking(
         file_identity(&part_path.validate_identity(part_identity)?)? == part_identity,
         "Reconciliation temporary entry changed before publication"
     );
-    let publication = publish_reconciliation_part_blocking(&part_path, &destination, part_identity)?;
+    let publication =
+        publish_reconciliation_part_blocking(&part_path, &destination, part_identity)?;
     after_publication();
     let expected_identity = match publication {
         PublishResult::Published | PublishResult::PublishedWithRetainedTemp => Some(part_identity),
