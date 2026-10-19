@@ -15,6 +15,65 @@ use std::sync::Arc;
 
 const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
 
+// Response presence/error shape only. A returned record is not proof of its
+// type, owner, relationship, resources, or deletion authority.
+fn lookup_record_status(record: Option<&Value>) -> &'static str {
+    let Some(record) = record else {
+        return "omitted";
+    };
+    match record.get("serverErrorCode").filter(|code| !code.is_null()) {
+        Some(code) => match code.as_str() {
+            Some("UNKNOWN_ITEM" | "NOT_FOUND") => "not_found",
+            Some("ACCESS_DENIED") => "access_denied",
+            Some("AUTHENTICATION_REQUIRED" | "AUTHENTICATION_FAILED") => "authentication_failed",
+            Some("ZONE_NOT_FOUND") => "zone_not_found",
+            Some("RETRY_LATER") => "retry_later",
+            Some("THROTTLED") => "throttled",
+            Some("SERVER_INTERNAL_ERROR") => "server_error",
+            Some(_) => "other_error",
+            None => "malformed_error",
+        },
+        None if record.get("deleted").and_then(Value::as_bool) == Some(true) => "tombstone",
+        None => "returned",
+    }
+}
+
+// Shape only. In particular, a different reference is not a qualified pair.
+fn child_reference_status(asset: Option<&Value>, request: &RecordLookupRequest) -> &'static str {
+    if request.asset_record_name.is_none() {
+        return "not_requested";
+    }
+    let Some(asset) = asset else {
+        return "omitted";
+    };
+    if lookup_record_status(Some(asset)) != "returned" {
+        return "unavailable";
+    }
+    if asset.get("recordType").and_then(Value::as_str) != Some("CPLAsset") {
+        return "invalid_child";
+    }
+    let Some(reference) = asset.pointer("/fields/masterRef") else {
+        return if asset
+            .get("fields")
+            .and_then(SparseShareEvidence::from_fields)
+            .is_some()
+        {
+            "sparse"
+        } else {
+            "missing"
+        };
+    };
+    match reference
+        .pointer("/value/recordName")
+        .and_then(Value::as_str)
+    {
+        Some(name) if name.trim().is_empty() => "malformed",
+        Some(name) if name == request.master_record_name.as_str() => "matches_requested",
+        Some(_) => "different",
+        None => "malformed",
+    }
+}
+
 // Only fixed labels leave this trust boundary. Never log provider record types,
 // error messages, identifiers, reference values, or response bodies here.
 fn asset_identity_diagnostic(
@@ -499,9 +558,12 @@ impl PhotoAlbum {
                 } else if !pair_matches {
                     asset
                         .filter(|record| {
-                            !primary_deleted
+                            // The old master may have disappeared after the child moved.
+                            // This remains only a hint; callers must confirm a fresh pair.
+                            !tombstoned(master)
                                 && master.is_none_or(|master| {
                                     master.get("serverErrorCode").is_none_or(Value::is_null)
+                                        || explicit_not_found(Some(master))
                                 })
                                 && record.get("serverErrorCode").is_none_or(Value::is_null)
                         })
@@ -612,8 +674,30 @@ impl PhotoAlbum {
                     };
                     let (supplied_owner, supplied_owner_type) =
                         supplied_owner_shape(master, asset, stage, &self.zone_id);
+                    let (master_status, child_status) = match request.target {
+                        RecordLookupTarget::Asset => {
+                            ("not_requested", lookup_record_status(master))
+                        }
+                        RecordLookupTarget::Master => (
+                            lookup_record_status(master),
+                            if request.asset_record_name.is_some() {
+                                lookup_record_status(asset)
+                            } else {
+                                "not_requested"
+                            },
+                        ),
+                    };
                     *rejection_diagnostics
-                        .entry((target, stage, reason, supplied_owner, supplied_owner_type))
+                        .entry((
+                            target,
+                            stage,
+                            reason,
+                            supplied_owner,
+                            supplied_owner_type,
+                            master_status,
+                            child_status,
+                            child_reference_status(asset, request),
+                        ))
                         .or_insert(0usize) += 1;
                 }
                 if request.target == RecordLookupTarget::Asset
@@ -652,12 +736,23 @@ impl PhotoAlbum {
             Some(owner) if owner.as_str() == Some("_defaultOwner") => "private_default",
             Some(_) => "other",
         };
-        for ((target, stage, reason, supplied_owner, supplied_owner_type), rejected_requests) in
-            rejection_diagnostics
+        for (
+            (
+                target,
+                stage,
+                reason,
+                supplied_owner,
+                supplied_owner_type,
+                master_status,
+                child_status,
+                child_reference_status,
+            ),
+            rejected_requests,
+        ) in rejection_diagnostics
         {
             tracing::info!(target: "kei::icloud::photos::album",
                 diagnostic = "exact_lookup_rejection_v1",
-                target, stage, reason, expected_owner, lookup_zone, rejected_requests, supplied_owner, supplied_owner_type, owner_provenance = "lookup_request",
+                target, stage, reason, expected_owner, lookup_zone, rejected_requests, supplied_owner, supplied_owner_type, master_status, child_status, child_reference_status, owner_provenance = "lookup_request",
                 "Targeted identity lookup retained unresolved requests"
             );
         }

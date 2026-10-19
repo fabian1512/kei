@@ -364,6 +364,10 @@ pub struct StatusArgs {
 /// Arguments for local diagnostics.
 #[derive(Parser, Debug, Clone)]
 pub struct DoctorArgs {
+    /// Inventory missing parent references using cached auth only; no media or catalogue access
+    #[arg(long, requires_all = ["live", "json"])]
+    pub missing_reference_inventory: bool,
+
     /// Emit a redacted JSON diagnostics report
     #[arg(long)]
     pub json: bool,
@@ -454,6 +458,8 @@ pub struct VerifyArgs {
 /// Arguments for the reconcile command.
 #[derive(Parser, Debug, Clone)]
 pub struct ReconcileArgs {
+    #[command(subcommand)]
+    pub action: Option<ReconcileAction>,
     /// Show what would change without updating the state database.
     #[arg(long)]
     pub dry_run: bool,
@@ -889,7 +895,7 @@ fn with_removed_sync_surface_hint(message: String) -> String {
 /// Clap still consumes option values, so a value named `support-export` cannot
 /// masquerade as the command. Partial export arguments must also avoid repair.
 #[must_use]
-pub(crate) fn is_support_export_invocation<I, T>(itr: I) -> bool
+pub(crate) fn is_early_read_only_invocation<I, T>(itr: I) -> bool
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -899,6 +905,18 @@ where
             .disable_help_flag(true)
             .disable_version_flag(true)
             .disable_help_subcommand(true)
+            .arg(
+                clap::Arg::new("entrypoint_help")
+                    .long("help")
+                    .short('h')
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("entrypoint_version")
+                    .long("version")
+                    .short('V')
+                    .action(clap::ArgAction::SetTrue),
+            )
             .mut_args(|argument| argument.env(None::<&str>))
             .mut_subcommands(query_command)
     }
@@ -913,6 +931,9 @@ where
         .try_get_matches_from(itr)
         .is_ok_and(|matches| {
             matches.subcommand_name() == Some("support-export")
+                || matches
+                    .subcommand_matches("doctor")
+                    .is_some_and(|doctor| doctor.get_flag("missing_reference_inventory"))
                 || matches
                     .subcommand_matches("help")
                     .is_some_and(|help| help.subcommand_name() == Some("support-export"))
@@ -2754,4 +2775,63 @@ mod tests {
             "--friendly after --no-friendly must win via overrides_with"
         );
     }
+}
+
+#[cfg(test)]
+mod read_only_entrypoint_tests {
+    #[test]
+    fn missing_reference_inventory_query_handles_partial_and_help_arguments() {
+        for arguments in [
+            vec![
+                "kei",
+                "doctor",
+                "--live",
+                "--json",
+                "--missing-reference-inventory",
+            ],
+            vec!["kei", "doctor", "--missing-reference-inventory"],
+            vec!["kei", "doctor", "--missing-reference-inventory", "--help"],
+            vec!["kei", "doctor", "--help", "--missing-reference-inventory"],
+        ] {
+            assert!(super::is_early_read_only_invocation(arguments));
+        }
+        for arguments in [
+            vec!["kei", "doctor", "--live", "--json"],
+            vec!["kei", "--config", "doctor", "status"],
+            vec!["kei", "sync"],
+        ] {
+            assert!(!super::is_early_read_only_invocation(arguments));
+        }
+    }
+}
+
+/// Bounded offline local-byte acceptance; source verification is unchanged.
+#[derive(Debug, Clone, clap::Args)]
+pub struct TrustedLegacyArgs {
+    #[command(subcommand)]
+    pub action: TrustedLegacyAction,
+}
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum TrustedLegacyAction {
+    /// Write a new reviewable JSON plan for one library (maximum 128 renditions)
+    Plan {
+        #[arg(long)]
+        library: String,
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Accept exactly the unchanged files and catalogue bindings in a reviewed plan
+    Apply {
+        #[arg(long)]
+        plan: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ReconcileAction {
+    /// Explicitly trust selected local files for preserved legacy migration (offline)
+    #[command(
+        after_help = "Documentation: https://github.com/rhoopr/kei/blob/main/docs/trusted-legacy-files.md"
+    )]
+    TrustLegacyFiles(TrustedLegacyArgs),
 }

@@ -1642,6 +1642,15 @@ controls distinguish missing/malformed references, actual different-master
 references and provider errors without exposing identifiers. Existing explicit
 non-default owner discovery and cancellation fixtures remain separate controls.
 
+The `issue956_lookup_record_status`, `issue956_rejection_groups` and
+`issue956_single_target_statuses` tests distinguish master/child provider
+errors and omissions through the real lookup path. Same-category responses
+aggregate, distinct failing members remain separate, and normal logs and
+retained history exclude private provider values. History reopen revalidates
+the fixed vocabulary and preserves older records with unavailable fields.
+These diagnostics make no additional provider requests and do not qualify
+sparse links or change lookup/checkpoint outcomes.
+
 ### Missing parent-reference diagnostics
 
 `preservation_proof::missing_reference::tests` exercises scoped response categories,
@@ -1669,3 +1678,25 @@ state changes are involved.
 The fixtures use no sleeps, retries, live credentials or provider requests.
 They demonstrate fork inheritance; they do not attribute the original parallel
 gate failure, whose conflicting descriptor was not captured.
+
+### Missing-reference inventory command
+
+`cargo test --all-features --lib diagnostic` and
+`cargo test --all-features --test cli missing_reference_inventory` exercise the
+cached-only early command path and restricted transport with synthetic auth and
+loopback provider fixtures. They cover all-EOF census/omissions, original auth and
+catalogue/media canaries, expired/future/malformed cache, endpoint qualification,
+HTTP authentication refusal, redirects, cancellation and shared raw-body/request
+budgets. Existing preservation and missing-reference lookup tests retain the
+ordinary fail-closed acceptance controls. No live account is used. Hard process
+supervision remains an external operational requirement, as documented in
+`docs/missing-reference-inventory.md`.
+
+`cargo test --lib trusted_legacy_files` exercises explicit local-byte acceptance
+through the real cycle owner using six synthetic historical renditions, four
+ready children and two mixed-owner families. It checks zero media GETs, unchanged
+source receipts and legacy rows/aliases, restart/idempotency, two quiet followups,
+atomic stale/cancelled/SQL-failed plans, and readiness/Primary bridge holds.
+Run it with default and `--no-default-features` profiles when changing trusted
+legacy receipts. Existing `legacy_preservation` tests retain the no-acceptance
+verified-source controls.

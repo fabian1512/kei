@@ -371,3 +371,98 @@ fn missing_reference_contract_rejects_private_and_numeric_categories() {
         );
     }
 }
+
+#[test]
+fn issue956_lookup_record_status_contract_is_closed_and_optional() {
+    for label in [
+        "not_requested",
+        "omitted",
+        "returned",
+        "tombstone",
+        "not_found",
+        "access_denied",
+        "authentication_failed",
+        "zone_not_found",
+        "retry_later",
+        "throttled",
+        "server_error",
+        "other_error",
+        "malformed_error",
+    ] {
+        let fields = json!({"master_status":label,"child_status":label});
+        assert_eq!(
+            privacy::diagnostic("exact_lookup_rejection_v1", fields.as_object().unwrap()).unwrap(),
+            fields.as_object().unwrap().clone()
+        );
+    }
+    for invalid in [
+        json!("ACCESS_DENIED"),
+        json!("PRIVATE_ERROR_CANARY"),
+        json!(401),
+        json!(null),
+        json!({"secret":"PRIVATE"}),
+    ] {
+        let fields = json!({"master_status":invalid,"child_status":invalid,"reason":"record_provider_error"});
+        let clean =
+            privacy::diagnostic("exact_lookup_rejection_v1", fields.as_object().unwrap()).unwrap();
+        assert_eq!(
+            clean,
+            json!({"reason":"record_provider_error"})
+                .as_object()
+                .unwrap()
+                .clone()
+        );
+    }
+    // Older retained history carries no newly invented response evidence.
+    let fields = json!({"target":"paired","reason":"record_provider_error"});
+    assert_eq!(
+        privacy::diagnostic("exact_lookup_rejection_v1", fields.as_object().unwrap()).unwrap(),
+        fields.as_object().unwrap().clone()
+    );
+}
+
+#[test]
+fn issue956_child_reference_status_is_a_field_specific_allowlist() {
+    for label in [
+        "not_requested",
+        "omitted",
+        "unavailable",
+        "invalid_child",
+        "missing",
+        "malformed",
+        "sparse",
+        "matches_requested",
+        "different",
+    ] {
+        let fields = json!({"child_reference_status":label});
+        assert_eq!(
+            privacy::diagnostic("exact_lookup_rejection_v1", fields.as_object().unwrap()).unwrap(),
+            *fields.as_object().unwrap()
+        );
+    }
+    for invalid in [
+        json!("PRIVATE_REFERENCE_CANARY"),
+        json!("returned"),
+        json!(42),
+        json!(null),
+        json!(true),
+        json!({"recordName":"PRIVATE"}),
+    ] {
+        let fields = json!({"child_reference_status":invalid,"reason":"record_provider_error"});
+        let clean =
+            privacy::diagnostic("exact_lookup_rejection_v1", fields.as_object().unwrap()).unwrap();
+        assert_eq!(
+            clean,
+            *json!({"reason":"record_provider_error"})
+                .as_object()
+                .unwrap()
+        );
+    }
+    let old = json!({"target":"paired","reason":"record_provider_error"});
+    let clean = privacy::diagnostic("exact_lookup_rejection_v1", old.as_object().unwrap()).unwrap();
+    assert_eq!(
+        clean,
+        *old.as_object().unwrap(),
+        "old history cannot invent reference evidence"
+    );
+}

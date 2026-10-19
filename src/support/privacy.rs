@@ -244,6 +244,9 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "supplied_owner",
             "supplied_owner_type",
             "owner_provenance",
+            "master_status",
+            "child_status",
+            "child_reference_status",
         ]),
         "support_missing_reference_v1" => Some(&[
             "record_history",
@@ -604,6 +607,27 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
         };
     }
     match key {
+        "child_reference_status" if kind == "exact_lookup_rejection_v1" => {
+            label.is_some_and(is_child_reference_status)
+        }
+        "master_status" | "child_status" if kind == "exact_lookup_rejection_v1" => matches!(
+            label,
+            Some(
+                "not_requested"
+                    | "omitted"
+                    | "returned"
+                    | "tombstone"
+                    | "not_found"
+                    | "access_denied"
+                    | "authentication_failed"
+                    | "zone_not_found"
+                    | "retry_later"
+                    | "throttled"
+                    | "server_error"
+                    | "other_error"
+                    | "malformed_error"
+            )
+        ),
         "expected_owner" if kind == "exact_lookup_rejection_v1" => {
             label.is_some_and(|label| matches!(label, "absent" | "private_default" | "other"))
         }
@@ -662,6 +686,21 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     }
 }
 
+pub(super) fn is_child_reference_status(value: &str) -> bool {
+    matches!(
+        value,
+        "not_requested"
+            | "omitted"
+            | "unavailable"
+            | "invalid_child"
+            | "missing"
+            | "malformed"
+            | "sparse"
+            | "matches_requested"
+            | "different"
+    )
+}
+
 pub(super) fn diagnostic(kind: &str, fields: &Map<String, Value>) -> Option<Map<String, Value>> {
     let allowed = contract(kind)?;
     let mut out: Map<String, Value> = fields
@@ -685,6 +724,18 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    // The tracing visitor checks this vocabulary before the diagnostic contract.
+    "not_requested",
+    "omitted",
+    "tombstone",
+    "access_denied",
+    "authentication_failed",
+    "zone_not_found",
+    "retry_later",
+    "throttled",
+    "server_error",
+    "other_error",
+    "malformed_error",
     "waiting",
     "started",
     "asset_identity",
